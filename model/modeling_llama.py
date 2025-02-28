@@ -51,6 +51,7 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 
 from kvcache.cluster import KVBiasCache
+from kvcache.reduced import NaiveKVBiasCache
 from .configuration_llama import LlamaConfig
 from .modeling_flex_attention import flex_attention_with_kv_bias, FlexAttentionKwargs
 
@@ -284,7 +285,7 @@ class LlamaAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if isinstance(past_key_value, KVBiasCache):
+        if isinstance(past_key_value, KVBiasCache) or isinstance(past_key_value, NaiveKVBiasCache):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states, kv_bias = past_key_value.update(
