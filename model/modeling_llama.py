@@ -51,6 +51,7 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 
 from kvcache.cluster import KVBiasCache
+from kvcache.iterative import IterativeReduceKVBiasCache
 from kvcache.reduced import NaiveKVBiasCache
 from .configuration_llama import LlamaConfig
 from .modeling_flex_attention import flex_attention_with_kv_bias, FlexAttentionKwargs
@@ -214,6 +215,19 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
+def repeat_kv_for_bias(kv_bias: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen) to (batch, num_attention_heads, seqlen)
+    """
+    batch, num_key_value_heads, slen = kv_bias.shape
+    if n_rep == 1:
+        return kv_bias
+    hidden_states = kv_bias[:, :, None, :].expand(batch, num_key_value_heads, n_rep, slen)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen)
+
+
+
 def eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -222,6 +236,7 @@ def eager_attention_forward(
     attention_mask: Optional[torch.Tensor],
     scaling: float,
     dropout: float = 0.0,
+    kv_bias: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
@@ -231,6 +246,10 @@ def eager_attention_forward(
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
+
+    if kv_bias is not None:
+        kv_bias = repeat_kv_for_bias(kv_bias, module.num_key_value_groups)
+        attn_weights = attn_weights + kv_bias[:, :, None, :]
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
@@ -285,14 +304,14 @@ class LlamaAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if isinstance(past_key_value, KVBiasCache) or isinstance(past_key_value, NaiveKVBiasCache):
+        if (isinstance(past_key_value, KVBiasCache) or isinstance(past_key_value, NaiveKVBiasCache)
+                or isinstance(past_key_value, IterativeReduceKVBiasCache)):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states, kv_bias = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
             kwargs['kv_bias'] = kv_bias
-            assert isinstance(attention_mask, BlockMask)
         elif past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
