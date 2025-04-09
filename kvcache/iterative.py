@@ -1,10 +1,15 @@
-from typing import Iterable, Optional, Dict, Any, List, Tuple
+from typing import Iterable, Optional, Dict, Any, List, Tuple, ContextManager
 
 import torch
 from transformers import DynamicCache
 
 
 VARY_LARGE_LONG = torch.tensor([2**62])
+
+
+class DudContextManager(ContextManager):
+    def __exit__(self, __exc_type, __exc_value, __traceback):
+        return self
 
 
 class IterativeReduceKVBiasCache(DynamicCache):
@@ -15,7 +20,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
         self.per_head_added_variance: List[torch.Tensor] = []
         self.max_variance_increase = max_variance_increase
 
-        self.optimize_stream = torch.Stream()
+        self.optimize_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
     def _init_empty(
             self,
@@ -44,7 +49,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
         if self.cluster_sizes[layer_idx].shape[-1] < 2:
             return  # nothing to optimize
 
-        with self.optimize_stream:
+        with self.optimize_stream if torch.cuda.is_available() else DudContextManager():
             # select subset to optimize
             key_states = self.key_cache[layer_idx][:, :, [-1], :]
             value_states = self.value_cache[layer_idx][:, :, [-1], :]
@@ -150,7 +155,8 @@ class IterativeReduceKVBiasCache(DynamicCache):
         """Gets the cache for this layer. Optimizes the next layer."""
 
         if layer_idx < len(self):
-            self.optimize_stream.synchronize()
+            if torch.cuda.is_available():
+                self.optimize_stream.synchronize()
 
             key_tensor = self.key_cache[layer_idx]
             value_tensor = self.value_cache[layer_idx]
