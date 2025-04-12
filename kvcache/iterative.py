@@ -14,7 +14,13 @@ class DudContextManager(ContextManager):
 
 
 class IterativeReduceKVBiasCache(DynamicCache):
-    def __init__(self, _distributed_cache_data: Iterable = None, *, max_variance_increase: float = 0.0) -> None:
+    def __init__(
+            self,
+            _distributed_cache_data: Iterable = None,
+            *,
+            max_variance_increase: float = 0.0,
+            protect_first: int = 0
+    ) -> None:
         super().__init__(_distributed_cache_data)
 
         self.curr_length: List[int] = []
@@ -26,6 +32,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
 
         self.per_head_added_variance: List[torch.Tensor] = []
         self.max_variance_increase = max_variance_increase
+        self.protect_first = protect_first
 
         self.optimize_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
@@ -41,7 +48,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
         if is_empty_layer:
             return 0
 
-        return self.curr_length[layer_idx]
+        return self.key_cache[layer_idx].shape[-2]
 
     def _init_empty(
             self,
@@ -84,6 +91,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
         with self.optimize_stream if torch.cuda.is_available() else DudContextManager():
             batch_size, n_heads, _, head_dims = self.key_cache[layer_idx].shape
             device = self.key_cache[layer_idx].device
+            dtype = self.key_cache[layer_idx].dtype
 
             # select subset to optimize
             key_states = torch.take_along_dim(
@@ -102,6 +110,13 @@ class IterativeReduceKVBiasCache(DynamicCache):
                 dim=-1
             )[:, :, :, None].transpose(-1, -2)  # move seq dimension to the back
 
+            # remove the subset from current cache
+            self.cluster_sizes[layer_idx][
+                torch.arange(batch_size).unsqueeze(1),
+                torch.arange(n_heads).unsqueeze(0),
+                self.last_available_idx[layer_idx][:, :, None]
+            ] = 0
+
             # examine for matches in the cache by computing pairwise square distance to each element in th cache
             old_norm = self.cached_sq_key_norms[layer_idx][:, :, :, None]  # (B, H, S_old, 1)
             cross_term = torch.matmul(self.key_cache[layer_idx], key_states.transpose(-1, -2))  # (B, H, S_old, S_new)
@@ -118,6 +133,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
             # padding is determined by 0 in cluster size
             protect_range = 1 / variance_weight  # this will make 0 into inf
             protect_range = torch.clamp(protect_range - 100, 0)  # inf - 100 = inf; vw \in [1/2, 1)
+            protect_range[:, :, :self.protect_first] = torch.inf
             pr_broadcast = protect_range[:, :, :, None]  # broadcast over new seq
             variance_increase = variance_increase + pr_broadcast
 
@@ -126,7 +142,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
             merge_condition = min_variance_increase < self.max_variance_increase
 
             invalid_variance = torch.isinf(min_variance_increase) | torch.isnan(min_variance_increase)
-            assert not invalid_variance.any()
+            merge_condition = merge_condition & ~invalid_variance
 
             # protect against merging with padding keys
             merge_condition = merge_condition & (min_idx < self.last_available_idx[layer_idx][:, :, None])
@@ -150,6 +166,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
 
                     # update cluster centroids
                     inertia = 1 / (curr_selected_sizes + 1)
+                    inertia = inertia.to(dtype=dtype)
 
                     # update keys
                     curr_selected_cluster_centroids = self.key_cache[layer_idx][batch_idx, head_idx, curr_min_idx]
@@ -169,6 +186,9 @@ class IterativeReduceKVBiasCache(DynamicCache):
 
                     # append unmerged
                     n_new = torch.sum(~curr_merge_condition).item()
+                    if not n_new:
+                        continue
+
                     last_idx = self.last_available_idx[layer_idx][batch_idx, head_idx]
 
                     self.cluster_sizes[layer_idx][batch_idx, head_idx, last_idx:last_idx + n_new] = torch.ones(
@@ -186,7 +206,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
                     new_values = curr_value_states[~curr_merge_condition, :]
                     self.value_cache[layer_idx][batch_idx, head_idx, last_idx:last_idx + n_new] = new_values
 
-                    self.last_available_idx[layer_idx][batch_idx, head_idx] += 1
+                    self.last_available_idx[layer_idx][batch_idx, head_idx] += n_new
 
     def _resize_if_needed(self, layer_idx: int, additional_length: int):
         current_capacity = self.cluster_sizes[layer_idx].shape[-1]
@@ -194,7 +214,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
         min_available = current_capacity - max_occupied.item()
 
         if min_available < additional_length:
-            # max(additional_length - min_available, 64, int(current_capacity / 3))
+            # extra_pad = max(additional_length - min_available, 64, int(current_capacity / 3))
             # FIXME: for some reason padding masking does not work..
             extra_pad = max(additional_length - min_available, 1)
 
@@ -263,11 +283,14 @@ class IterativeReduceKVBiasCache(DynamicCache):
                 # FIXME: only works auto-regressively for now
                 assert seq_length == 1
 
-                # important: we do not change last_available_idx or cluster size (see optimize)
+                # important: we do not change last_available_idx (see optimize)
+                self.cluster_sizes[layer_idx][batch_index, head_index, seq_index] = 1
                 self.key_cache[layer_idx][batch_index, head_index, seq_index] = key_states.squeeze(dim=-2)
                 self.value_cache[layer_idx][batch_index, head_index, seq_index] = value_states.squeeze(dim=-2)
 
                 key_norm = torch.sum(key_states ** 2, dim=-1).squeeze(dim=-1)
                 self.cached_sq_key_norms[layer_idx][batch_index, head_index, seq_index] = key_norm
 
+        # log(0) = -inf, so the padding should have 0 attention score
+        # print(torch.log(self.cluster_sizes[layer_idx]))
         return self.key_cache[layer_idx], self.value_cache[layer_idx], torch.log(self.cluster_sizes[layer_idx])

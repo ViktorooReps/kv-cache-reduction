@@ -223,8 +223,8 @@ def repeat_kv_for_bias(kv_bias: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen = kv_bias.shape
     if n_rep == 1:
         return kv_bias
-    hidden_states = kv_bias[:, :, None, :].expand(batch, num_key_value_heads, n_rep, slen)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen)
+    kv_bias = kv_bias[:, :, None, :].expand(batch, num_key_value_heads, n_rep, slen)
+    return kv_bias.reshape(batch, num_key_value_heads * n_rep, slen)
 
 
 
@@ -243,13 +243,16 @@ def eager_attention_forward(
     value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
+    #print('weights', attn_weights.shape)
     if kv_bias is not None:
         kv_bias = repeat_kv_for_bias(kv_bias, module.num_key_value_groups)
+        #print('bias', kv_bias.shape)
         attn_weights = attn_weights + kv_bias[:, :, None, :]
+
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        #print('mask', attention_mask.shape)
+        attn_weights = attn_weights + causal_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
@@ -591,6 +594,9 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values = DynamicCache()
 
         if cache_position is None:
+            if isinstance(past_key_values, IterativeReduceKVBiasCache):
+                raise RuntimeError('Please use `cache_position` to specify correct position')
+
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
@@ -710,7 +716,7 @@ class LlamaModel(LlamaPreTrainedModel):
             target_length = (
                 attention_mask.shape[-1]
                 if isinstance(attention_mask, torch.Tensor)
-                else past_seen_tokens + sequence_length + 1
+                else past_seen_tokens + sequence_length + 1000
             )
 
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
