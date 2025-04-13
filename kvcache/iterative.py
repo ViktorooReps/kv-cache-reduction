@@ -246,9 +246,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
         min_available = current_capacity - max_occupied.item()
 
         if min_available < additional_length:
-            # extra_pad = max(additional_length - min_available, 64, int(current_capacity / 3))
-            # FIXME: for some reason padding masking does not work..
-            extra_pad = max(additional_length - min_available, 1)
+            extra_pad = max(additional_length - min_available, 64, int(current_capacity / 3))
 
             batch_size, n_heads, current_capacity, head_dims = self.key_cache[layer_idx].shape
             device = self.key_cache[layer_idx].device
