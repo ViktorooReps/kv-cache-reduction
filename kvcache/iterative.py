@@ -88,7 +88,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
         if self.get_seq_length(layer_idx) < 2:
             return  # nothing to optimize
 
-        with self.optimize_stream if torch.cuda.is_available() else DudContextManager():
+        with torch.cuda.stream(self.optimize_stream) if torch.cuda.is_available() else DudContextManager():
             batch_size, n_heads, _, head_dims = self.key_cache[layer_idx].shape
             device = self.key_cache[layer_idx].device
             dtype = self.key_cache[layer_idx].dtype
