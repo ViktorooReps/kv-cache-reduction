@@ -4,6 +4,9 @@ import torch
 from transformers import DynamicCache
 
 
+# TODO: test on CUDA
+
+
 class DudContextManager(ContextManager):
     def __exit__(self, __exc_type, __exc_value, __traceback):
         # If an exception is raised, re-raise it
@@ -40,17 +43,19 @@ class IterativeReduceKVBiasCache(DynamicCache):
         #
         #
         # At time step t, update[i] call will:
-        # 1. Wait for optimize_stream[i] stream to synchronize (equivalent to finishing
-        #   the optimization from the t - 1 step)
+        # 1. Wait for finishing the optimization from the t - 1 step by waiting on the self.optimization_end_event[i]
         # 2. Add new KV, launch the optimization
         #   2.1 Record the self.optimization_start_event[i]
         #   2.2 During optimization, do not modify cache while optimization for the layer (i + 1) mod L has not started.
         #       This is done by waiting on self.optimization_start_event[(i + 1) % L] event.
         #   2.3 Reset the self.optimization_start_event[(i + 1) % L] event. Double record will not happen since
         #       layer i at t + 1 will wait for the optimization from t to finish.
+        #   2.4 Optimize cache (this will block forward execution at t + 1 step)
+        #   2.5 Record the self.optimization_end_event[i]
         # 3. Return from update <- this is done way before 2 is complete
         self.optimize_streams: List[torch.cuda.Stream] = []
         self.optimization_start_event: List[torch.cuda.Event] = []
+        self.optimization_end_event: List[torch.cuda.Event] = []
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
@@ -100,6 +105,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
         if torch.cuda.is_available():
             self.optimize_streams[layer_idx] = torch.cuda.Stream(priority=-1)
             self.optimization_start_event[layer_idx] = torch.cuda.Event()
+            self.optimization_end_event[layer_idx] = torch.cuda.Event()
 
     def optimize_last_entry(self, layer_idx: int) -> None:
         # First order of business: indicate to the optimization process from the previous layer that the model
@@ -240,6 +246,9 @@ class IterativeReduceKVBiasCache(DynamicCache):
             self.value_cache[layer_idx][batch_idx, head_idx, last_idx] = value_states * not_merged[:, :, None]
             self.last_available_idx[layer_idx] += not_merged
 
+            if self.optimization_end_event[layer_idx] is not None and self.optimize_streams[layer_idx] is not None:
+                self.optimization_end_event[layer_idx].record(self.optimize_streams[layer_idx])
+
     def _resize_if_needed(self, layer_idx: int, additional_length: int):
         current_capacity = self.cluster_sizes[layer_idx].shape[-1]
         max_occupied = self.last_available_idx[layer_idx].max()
@@ -269,6 +278,11 @@ class IterativeReduceKVBiasCache(DynamicCache):
             cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
+        # Wait for the last optimize call
+        if self.optimization_end_event[layer_idx] is not None:
+            self.optimization_end_event[layer_idx].wait(stream=torch.cuda.current_stream())
+            self.optimization_end_event[layer_idx] = torch.cuda.Event()
+
         batch_size, n_heads, seq_length, head_dims = key_states.shape
         device = key_states.device
 
@@ -284,6 +298,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
                     self.curr_length.append(0)
                     self.optimize_streams.append(None)
                     self.optimization_start_event.append(None)
+                    self.optimization_end_event.append(None)
 
                 # init kv state
                 super().update(key_states, value_states, layer_idx, cache_kwargs)
