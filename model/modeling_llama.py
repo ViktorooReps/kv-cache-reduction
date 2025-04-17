@@ -307,7 +307,8 @@ class LlamaAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if (isinstance(past_key_value, KVBiasCache) or isinstance(past_key_value, NaiveKVBiasCache)
+        if (isinstance(past_key_value, KVBiasCache)
+                or isinstance(past_key_value, NaiveKVBiasCache)
                 or isinstance(past_key_value, IterativeReduceKVBiasCache)):
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}

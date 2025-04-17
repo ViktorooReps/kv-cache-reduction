@@ -1,18 +1,13 @@
-from typing import Iterable, Optional, Dict, Any, List, Tuple, ContextManager
+from typing import Iterable, Optional, Dict, Any, List, Tuple
 
 import torch
 from transformers import DynamicCache
 
+from kvcache.optimization_orchestrator import OptimizationOrchestrator
+from kvcache.wrapped_manager import WrappedManager
+
 
 # TODO: test on CUDA
-
-
-class DudContextManager(ContextManager):
-    def __exit__(self, __exc_type, __exc_value, __traceback):
-        # If an exception is raised, re-raise it
-        if __exc_type is not None:
-            raise __exc_value
-        return False
 
 
 class IterativeReduceKVBiasCache(DynamicCache):
@@ -20,8 +15,10 @@ class IterativeReduceKVBiasCache(DynamicCache):
             self,
             _distributed_cache_data: Iterable = None,
             *,
-            max_variance_increase: float = 0.0,
-            protect_first: int = 0
+            # MVI = Maximum Variance Increase
+            decay_start_mvi: int = 20,
+            decay_end_mvi: int = 200,
+            max_mvi: float = 0.0,
     ) -> None:
         super().__init__(_distributed_cache_data)
 
@@ -29,33 +26,27 @@ class IterativeReduceKVBiasCache(DynamicCache):
 
         # (B, H, S)
         self.cluster_sizes: List[torch.Tensor] = []
-        self.cached_sq_key_norms: List[torch.Tensor] = []
+        self.cached_sq_norms: List[torch.Tensor] = []
         self.last_available_idx: List[torch.Tensor] = []
+        self.first_non_optimized_idx: List[torch.Tensor] = []
 
         self.per_head_added_variance: List[torch.Tensor] = []
-        self.max_variance_increase = max_variance_increase
-        self.protect_first = protect_first
+        self.max_mvi = max_mvi
+        self.decay_start_mvi = decay_start_mvi
+        self.decay_end_mvi = decay_end_mvi
 
-        # Overview of the synchronization algorithm:
-        # 1. We need to start optimizing the layer before exiting update method
-        # 2. We need to make sure the model is not using the cache while it is optimizing
-        # 3. We need to make sure the optimization is complete before starting update
-        #
-        #
-        # At time step t, update[i] call will:
-        # 1. Wait for finishing the optimization from the t - 1 step by waiting on the self.optimization_end_event[i]
-        # 2. Add new KV, launch the optimization
-        #   2.1 Record the self.optimization_start_event[i]
-        #   2.2 During optimization, do not modify cache while optimization for the layer (i + 1) mod L has not started.
-        #       This is done by waiting on self.optimization_start_event[(i + 1) % L] event.
-        #   2.3 Reset the self.optimization_start_event[(i + 1) % L] event. Double record will not happen since
-        #       layer i at t + 1 will wait for the optimization from t to finish.
-        #   2.4 Optimize cache (this will block forward execution at t + 1 step)
-        #   2.5 Record the self.optimization_end_event[i]
-        # 3. Return from update <- this is done way before 2 is complete
         self.optimize_streams: List[torch.cuda.Stream] = []
-        self.optimization_start_event: List[torch.cuda.Event] = []
-        self.optimization_end_event: List[torch.cuda.Event] = []
+        self.orchestrator = OptimizationOrchestrator() if torch.cuda.is_available() else None
+
+    def get_mvi(self, step: int) -> float:
+        if step < self.decay_start_mvi:
+            return 0.0
+        if self.decay_start_mvi <= step < self.decay_end_mvi:
+            decay_interval = self.decay_end_mvi - self.decay_start_mvi
+            progress = (step - self.decay_start_mvi) / decay_interval
+            return progress * self.max_mvi
+
+        return self.max_mvi
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
@@ -94,39 +85,32 @@ class IterativeReduceKVBiasCache(DynamicCache):
             dtype=torch.long
         )
 
-        self.cached_sq_key_norms[layer_idx] = torch.sum(self.key_cache[layer_idx] ** 2, dim=-1)
+        self.cached_sq_norms[layer_idx] = torch.sum(self.key_cache[layer_idx] ** 2, dim=-1)
         self.last_available_idx[layer_idx] = torch.full(
             size=(batch_size, n_heads),
             fill_value=seq_length,
             device=device,
             dtype=torch.long
         )
+        self.first_non_optimized_idx[layer_idx] = torch.zeros_like(self.last_available_idx[layer_idx])
 
         if torch.cuda.is_available():
             self.optimize_streams[layer_idx] = torch.cuda.Stream(priority=-1)
-            self.optimization_start_event[layer_idx] = torch.cuda.Event()
-            self.optimization_end_event[layer_idx] = torch.cuda.Event()
 
-    def optimize_last_entry(self, layer_idx: int) -> None:
-        # First order of business: indicate to the optimization process from the previous layer that the model
-        #   forward pass is done with KV cache from that layer. If CUDA is not available, everything is sequential,
-        #   so there is no need in this.
-        if self.optimization_start_event[layer_idx] is not None and self.optimize_streams[layer_idx] is not None:
-            self.optimization_start_event[layer_idx].record(self.optimize_streams[layer_idx])
+    def optimize_last_entries(self, layer_idx: int, n_optimize: int, step: int) -> None:
+        to_wrap = None
+        timestep = None
 
-        if len(self.key_cache) < layer_idx or not len(self.key_cache[layer_idx]):
-            return  # empty cache
-
-        if self.get_seq_length(layer_idx) < 2:
-            return  # nothing to optimize
-
-        max_available_idx = torch.max(self.last_available_idx[layer_idx])
-        if max_available_idx <= self.protect_first:
-            return  # do not merge the first self.protect_first from merging into anything
-
-        manager = DudContextManager()
         if self.optimize_streams[layer_idx] is not None:
-            manager = torch.cuda.stream(self.optimize_streams[layer_idx])
+            to_wrap = torch.cuda.stream(self.optimize_streams[layer_idx])
+
+        def end_optimize():
+            if self.orchestrator is not None and self.optimize_streams[layer_idx] is not None:
+                if timestep is None:
+                    raise RuntimeError(f'Premature end of optimization! start_optimization has not been called!')
+                self.orchestrator.end_optimization(timestep, layer_idx, stream=self.optimize_streams[layer_idx])
+
+        manager = WrappedManager(to_wrap, on_exit=end_optimize)
 
         with manager:
             # Two possibilities:
@@ -137,117 +121,124 @@ class IterativeReduceKVBiasCache(DynamicCache):
             batch_size, n_heads, _, head_dims = self.key_cache[layer_idx].shape
             dtype = self.key_cache[layer_idx].dtype
 
-            batch_idx = torch.arange(batch_size).unsqueeze(1)
-            head_idx = torch.arange(n_heads).unsqueeze(0)
+            first_entry = self.first_non_optimized_idx[layer_idx]   # (B, H)
+            first_entry_3d = first_entry[:, :, None].expand(-1, -1, n_optimize)
+            relative_index = torch.arange(n_optimize, device=first_entry.device)
+            last_entries_idx = first_entry_3d + relative_index[None, None, :]  # (B, H, S_new)
 
-            last_entry_idx = self.last_available_idx[layer_idx] - 1
+            last_entries_idx_4d = last_entries_idx[:, :, :, None].expand(-1, -1, -1, head_dims)
 
             # select last entry to optimize
-            key_states = torch.take_along_dim(self.key_cache[layer_idx], last_entry_idx[:, :, None, None], dim=-2)
-            value_states = torch.take_along_dim(self.value_cache[layer_idx], last_entry_idx[:, :, None, None], dim=-2)
+            key_states = torch.take_along_dim(self.key_cache[layer_idx], last_entries_idx_4d, dim=-2)
+            value_states = torch.take_along_dim(self.value_cache[layer_idx], last_entries_idx_4d, dim=-2)
             new_norm = torch.take_along_dim(
-                self.cached_sq_key_norms[layer_idx],
-                last_entry_idx[:, :, None],
+                self.cached_sq_norms[layer_idx],
+                last_entries_idx,
                 dim=-1
             )[:, :, :, None].transpose(-1, -2)  # move seq dimension to the back
 
             # remove the last entry from current cache
             new_cluster_sizes = torch.clone(self.cluster_sizes[layer_idx])  # clone to not affect the cache state
-            new_cluster_sizes[batch_idx, head_idx, last_entry_idx] = 0
+            cluster_sizes_zero_fill = torch.zeros_like(last_entries_idx, device=new_cluster_sizes.device)
+            new_cluster_sizes.scatter_(dim=-1, index=last_entries_idx, src=cluster_sizes_zero_fill)
 
-            # here S_new will be 1
-
-            # examine for matches in the cache by computing pairwise square distance to each element in th cache
-            old_norm = self.cached_sq_key_norms[layer_idx][:, :, :, None]  # (B, H, S_old, 1)
+            # examine for matches in the cache by computing pairwise square distance to each element in the cache
+            old_norm = self.cached_sq_norms[layer_idx][:, :, :, None]  # (B, H, S_old, 1)
             cross_term = torch.matmul(self.key_cache[layer_idx], key_states.transpose(-1, -2))  # (B, H, S_old, S_new)
             sq_dist = new_norm + old_norm - 2 * cross_term  # (B, H, S_old, S_new)
 
             # CAREFUL: this value will be 0 for padding
             variance_weight = new_cluster_sizes / (new_cluster_sizes + 1)
-            vw_broadcast = variance_weight[:, :, :, None]  # broadcast over new seq
+            variance_weight_bcast_4d = variance_weight[:, :, :, None]  # broadcast over new seq
 
             # depends on cluster sizes and distance to new element
-            variance_increase = vw_broadcast * sq_dist
+            variance_increase = variance_weight_bcast_4d * sq_dist
 
             # protect from selecting padding as merging candidate (still can happen if there is no other candidate)
             # padding is determined by 0 in cluster size
             protect_range = 1 / variance_weight  # this will make 0 into inf
             protect_range = torch.clamp(protect_range - 100, 0)  # inf - 100 = inf; vw \in [1/2, 1)
-            protect_range[:, :, :self.protect_first] = torch.inf
-            pr_broadcast = protect_range[:, :, :, None]  # broadcast over new seq
-            variance_increase = variance_increase + pr_broadcast
+            protect_range[:, :, :self.decay_start_mvi] = torch.inf
+            protect_range_bcast_4d = protect_range[:, :, :, None]  # broadcast over new seq
+            variance_increase = variance_increase + protect_range_bcast_4d
 
             # (B, H, S_new) and (B, H, S_new)
             min_variance_increase, min_idx = torch.min(variance_increase, dim=-2)
-            merge_condition = min_variance_increase < self.max_variance_increase
+            merge_condition = min_variance_increase < self.get_mvi(step)
 
             invalid_variance = torch.isinf(min_variance_increase) | torch.isnan(min_variance_increase)
             merge_condition = merge_condition & ~invalid_variance
 
-            # protect against merging with padding keys
-            merge_condition = merge_condition & (min_idx < last_entry_idx[:, :, None])
+            # protect against merging with padding keys and last entries
+            merge_condition = merge_condition & (min_idx < first_entry_3d)
+            merge_condition_4d = merge_condition[:, :, :, None].expand(-1, -1, -1, head_dims)
 
-            # UPDATE KV CACHE STATE [RACE CONDITION WARNING]
+            # UPDATE KV CACHE STATE
             # We need to wait for the forward layer call to finish working with the current state of KV cache of this
-            #   layer. The certain indication of this is that the optimization for the next layer has started.
-            #   No need to wait if no CUDA is available as everything is sequential this way.
-            if self.optimization_start_event[layer_idx] is not None and self.optimize_streams[layer_idx] is not None:
-                next_layer_idx = (layer_idx + 1) % len(self.key_cache)  # TODO
-                self.optimization_start_event[next_layer_idx].wait(self.optimize_streams[layer_idx])
-
-                # reset for the next call of this function
-                self.optimization_start_event[next_layer_idx] = torch.cuda.Event()
+            if self.orchestrator is not None and self.optimize_streams[layer_idx] is not None:
+                timestep = self.orchestrator.start_optimization(layer_idx, stream=self.optimize_streams[layer_idx])
 
             # remove the last entry from the current cache
-            self.cluster_sizes[layer_idx][batch_idx, head_idx, last_entry_idx] = 0
-            self.last_available_idx[layer_idx] -= 1
+            self.cluster_sizes[layer_idx].scatter_(dim=-1, index=last_entries_idx, src=cluster_sizes_zero_fill)
 
             # update current added variance
             added_variance = torch.sum(min_variance_increase * merge_condition, dim=-1)
             self.per_head_added_variance[layer_idx] = self.per_head_added_variance[layer_idx] + added_variance
 
-            # we will update KV cache at [batch_idx, head_idx, seq_idx] locations
-            # S_new = 1
-            seq_idx = min_idx.squeeze(-1)
-            merge_condition = merge_condition.squeeze(-1)
-            key_states = key_states.squeeze(-2)
-            value_states = value_states.squeeze(-2)
+            # we will update KV cache at seq_idx locations
+            seq_idx = min_idx  # seq_idx is the positions of the elements to merge into
+            seq_idx_4d = seq_idx[:, :, :, None].expand(-1, -1, -1, head_dims)
 
             # update existing cluster sizes
-            selected_cluster_sizes = self.cluster_sizes[layer_idx][batch_idx, head_idx, seq_idx]
-            self.cluster_sizes[layer_idx][batch_idx, head_idx, seq_idx] = selected_cluster_sizes + merge_condition
+            selected_cluster_sizes = torch.take_along_dim(self.cluster_sizes[layer_idx], seq_idx, dim=-1)
+            new_cluster_sizes = selected_cluster_sizes + merge_condition
+            self.cluster_sizes[layer_idx].scatter_(dim=-1, index=seq_idx, src=new_cluster_sizes)
 
             # update cluster centroids, inertia is computed based on the previous values
             inertia = 1 / (selected_cluster_sizes + 1)
             inertia = inertia.to(dtype=dtype)
+            inertia_4d = inertia[:, :, :, None].expand(-1, -1, -1, head_dims)
 
             # update keys
-            selected_cluster_centroids = self.key_cache[layer_idx][batch_idx, head_idx, seq_idx]
-            change = inertia[:, :, None] * (key_states - selected_cluster_centroids)
-            new_selected_clusters = selected_cluster_centroids + change * merge_condition[:, :, None]
-            self.key_cache[layer_idx][batch_idx, head_idx, seq_idx] = new_selected_clusters
+            selected_cluster_centroids = torch.take_along_dim(self.key_cache[layer_idx], seq_idx_4d, dim=-2)
+            change = inertia_4d * (key_states - selected_cluster_centroids)
+            new_selected_clusters = selected_cluster_centroids + change * merge_condition_4d
+            self.key_cache[layer_idx].scatter_(dim=-2, index=seq_idx_4d, src=new_selected_clusters)
 
             # update cached norms for updated keys
             new_sq_key_norms = torch.sum(new_selected_clusters ** 2, dim=-1)
-            self.cached_sq_key_norms[layer_idx][batch_idx, head_idx, seq_idx] = new_sq_key_norms
+            self.cached_sq_norms[layer_idx].scatter_(dim=-1, index=seq_idx, src=new_sq_key_norms)
 
             # update values
-            selected_cluster_centroids = self.value_cache[layer_idx][batch_idx, head_idx, seq_idx]
-            change = inertia[:, :, None] * (value_states - selected_cluster_centroids)
-            new_selected_clusters = selected_cluster_centroids + change * merge_condition[:, :, None]
-            self.value_cache[layer_idx][batch_idx, head_idx, seq_idx] = new_selected_clusters
+            selected_cluster_centroids = torch.take_along_dim(self.value_cache[layer_idx], seq_idx_4d, dim=-2)
+            change = inertia_4d * (value_states - selected_cluster_centroids)
+            new_selected_clusters = selected_cluster_centroids + change * merge_condition_4d
+            self.value_cache[layer_idx].scatter_(dim=-2, index=seq_idx_4d, src=new_selected_clusters)
 
-            last_idx = self.last_available_idx[layer_idx]
+            # we will update KV cache at [batch_idx, head_idx, seq_idx] locations
+            seq_idx = last_entries_idx  # seq_idx are the positions of the last elements
+            seq_idx_4d = seq_idx[:, :, :, None].expand(-1, -1, -1, head_dims)
+
             not_merged = ~merge_condition
 
-            self.cluster_sizes[layer_idx][batch_idx, head_idx, last_idx] = not_merged.to(dtype=torch.long)
-            self.key_cache[layer_idx][batch_idx, head_idx, last_idx] = key_states * not_merged[:, :, None]
-            self.cached_sq_key_norms[layer_idx][batch_idx, head_idx, last_idx] = new_sq_key_norms * not_merged
-            self.value_cache[layer_idx][batch_idx, head_idx, last_idx] = value_states * not_merged[:, :, None]
-            self.last_available_idx[layer_idx] += not_merged
+            # sort new entries by not_merged condition: not_merged - [1, 1, 1, 1, 0, 0, 0] <- over seq dimension
+            not_merged_sorted, idx_sorted = torch.sort(not_merged, dim=-1, descending=True)
+            not_merged_srt_4d = not_merged_sorted[:, :, :, None].expand(-1, -1, -1, head_dims)
+            idx_srt_4d = idx_sorted[:, :, :, None].expand(-1, -1, -1, head_dims)
 
-            if self.optimization_end_event[layer_idx] is not None and self.optimize_streams[layer_idx] is not None:
-                self.optimization_end_event[layer_idx].record(self.optimize_streams[layer_idx])
+            new_keys_sorted = torch.take_along_dim(key_states, idx_srt_4d, dim=-2) * not_merged_srt_4d
+            new_values_sorted = torch.take_along_dim(value_states, idx_srt_4d, dim=-2) * not_merged_srt_4d
+            new_norms_sorted = torch.take_along_dim(new_sq_key_norms, idx_sorted, dim=-1) * not_merged_sorted
+
+            self.cluster_sizes[layer_idx].scatter_(dim=-1, index=seq_idx, src=not_merged_sorted.to(dtype=torch.long))
+            self.key_cache[layer_idx].scatter_(dim=-2, index=seq_idx_4d, src=new_keys_sorted)
+            self.cached_sq_norms[layer_idx].scatter_(dim=-1, index=seq_idx, src=new_norms_sorted)
+            self.value_cache[layer_idx].scatter_(dim=-2, index=seq_idx_4d, src=new_values_sorted)
+
+            n_not_merged = not_merged.sum(dim=-1)
+            not_merged_end = first_entry + n_not_merged
+            self.last_available_idx[layer_idx] = not_merged_end
+            self.first_non_optimized_idx[layer_idx] = not_merged_end
 
     def _resize_if_needed(self, layer_idx: int, additional_length: int):
         current_capacity = self.cluster_sizes[layer_idx].shape[-1]
@@ -268,7 +259,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], pad_vector], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], pad_vector], dim=-2)
             self.cluster_sizes[layer_idx] = torch.cat([self.cluster_sizes[layer_idx], pad_cluster_size], dim=-1)
-            self.cached_sq_key_norms[layer_idx] = torch.cat([self.cached_sq_key_norms[layer_idx], pad_norm], dim=-1)
+            self.cached_sq_norms[layer_idx] = torch.cat([self.cached_sq_norms[layer_idx], pad_norm], dim=-1)
 
     def update(
             self,
@@ -278,10 +269,9 @@ class IterativeReduceKVBiasCache(DynamicCache):
             cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        # Wait for the last optimize call
-        if self.optimization_end_event[layer_idx] is not None:
-            self.optimization_end_event[layer_idx].wait(stream=torch.cuda.current_stream())
-            self.optimization_end_event[layer_idx] = torch.cuda.Event()
+        # wait for the optimization from the previous timestep to finish
+        if self.orchestrator is not None and self.optimize_streams[layer_idx] is not None:
+            self.orchestrator.start_forward(layer_idx, stream=torch.cuda.current_stream())
 
         batch_size, n_heads, seq_length, head_dims = key_states.shape
         device = key_states.device
@@ -293,12 +283,11 @@ class IterativeReduceKVBiasCache(DynamicCache):
                 for _ in range(len(self.cluster_sizes), layer_idx + 1):
                     self.per_head_added_variance.append([])
                     self.last_available_idx.append([])
+                    self.first_non_optimized_idx.append([])
                     self.cluster_sizes.append([])
-                    self.cached_sq_key_norms.append([])
+                    self.cached_sq_norms.append([])
                     self.curr_length.append(0)
                     self.optimize_streams.append(None)
-                    self.optimization_start_event.append(None)
-                    self.optimization_end_event.append(None)
 
                 # init kv state
                 super().update(key_states, value_states, layer_idx, cache_kwargs)
@@ -316,27 +305,24 @@ class IterativeReduceKVBiasCache(DynamicCache):
             else:
                 self._resize_if_needed(layer_idx, seq_length)
 
-                self.curr_length[layer_idx] += 1
+                self.curr_length[layer_idx] += seq_length
 
-                batch_index = torch.arange(batch_size).unsqueeze(1)
-                head_index = torch.arange(n_heads).unsqueeze(0)
-                seq_index = self.last_available_idx[layer_idx]
+                first_available = self.last_available_idx[layer_idx]  # (B, H)
+                relative_index = torch.arange(seq_length, device=first_available.device)
+                last_entries_idx = first_available[:, :, None] + relative_index[None, None, :]  # (B, H, S_new)
+                last_entries_idx_4d = last_entries_idx[:, :, :, None].expand(-1, -1, -1, head_dims)
 
-                # FIXME: only works auto-regressively for now
-                assert seq_length == 1
+                self.cluster_sizes[layer_idx].scatter_(-1, last_entries_idx, torch.ones_like(last_entries_idx))
+                self.key_cache[layer_idx].scatter_(-2, last_entries_idx_4d, key_states)
+                self.value_cache[layer_idx].scatter_(-2, last_entries_idx_4d, value_states)
 
-                # important: we do not change last_available_idx (see optimize)
-                self.cluster_sizes[layer_idx][batch_index, head_index, seq_index] = 1
-                self.key_cache[layer_idx][batch_index, head_index, seq_index] = key_states.squeeze(dim=-2)
-                self.value_cache[layer_idx][batch_index, head_index, seq_index] = value_states.squeeze(dim=-2)
+                key_norm = torch.sum(key_states ** 2, dim=-1)
+                self.cached_sq_norms[layer_idx].scatter_(-1, last_entries_idx, key_norm)
+                self.last_available_idx[layer_idx] = self.last_available_idx[layer_idx] + seq_length
 
-                key_norm = torch.sum(key_states ** 2, dim=-1).squeeze(dim=-1)
-                self.cached_sq_key_norms[layer_idx][batch_index, head_index, seq_index] = key_norm
-                self.last_available_idx[layer_idx] += 1
-
-                # optimize the last entry added
-                # on CUDA, this will be called in a separate Stream and CPU process will continue ASAP
-                self.optimize_last_entry(layer_idx=layer_idx)
+        # optimize the last entry added
+        # on CUDA, this will be called in a separate Stream and CPU process will continue ASAP
+        self.optimize_last_entries(layer_idx=layer_idx, n_optimize=seq_length, step=self.curr_length[layer_idx])
 
         # log(0) = -inf, so the padding will have 0 attention score
         return self.key_cache[layer_idx], self.value_cache[layer_idx], torch.log(self.cluster_sizes[layer_idx])
