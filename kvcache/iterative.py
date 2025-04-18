@@ -16,9 +16,8 @@ class IterativeReduceKVBiasCache(DynamicCache):
             _distributed_cache_data: Iterable = None,
             *,
             # MVI = Maximum Variance Increase
-            decay_start_mvi: int = 20,
-            decay_end_mvi: int = 200,
-            max_mvi: float = 0.0,
+            protect_first: int = 20,
+            mvi: float = 0.0,
     ) -> None:
         super().__init__(_distributed_cache_data)
 
@@ -31,22 +30,11 @@ class IterativeReduceKVBiasCache(DynamicCache):
         self.first_non_optimized_idx: List[torch.Tensor] = []
 
         self.per_head_added_variance: List[torch.Tensor] = []
-        self.max_mvi = max_mvi
-        self.decay_start_mvi = decay_start_mvi
-        self.decay_end_mvi = decay_end_mvi
+        self.mvi = mvi
+        self.protect_first = protect_first
 
         self.optimize_streams: List[torch.cuda.Stream] = []
         self.orchestrator = OptimizationOrchestrator() if torch.cuda.is_available() else None
-
-    def get_mvi(self, step: int) -> float:
-        if step < self.decay_start_mvi:
-            return 0.0
-        if self.decay_start_mvi <= step < self.decay_end_mvi:
-            decay_interval = self.decay_end_mvi - self.decay_start_mvi
-            progress = (step - self.decay_start_mvi) / decay_interval
-            return progress * self.max_mvi
-
-        return self.max_mvi
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Returns the sequence length of the cached states. A layer index can be optionally passed."""
@@ -61,6 +49,10 @@ class IterativeReduceKVBiasCache(DynamicCache):
             return 0
 
         return self.key_cache[layer_idx].shape[-2]
+
+    def _init_cuda(self, layer_idx: int) -> None:
+        while len(self.optimize_streams) <= layer_idx:
+            self.optimize_streams.append(torch.cuda.Stream(priority=-1))
 
     def _init_empty(
             self,
@@ -95,9 +87,9 @@ class IterativeReduceKVBiasCache(DynamicCache):
         self.first_non_optimized_idx[layer_idx] = torch.zeros_like(self.last_available_idx[layer_idx])
 
         if torch.cuda.is_available():
-            self.optimize_streams[layer_idx] = torch.cuda.Stream(priority=-1)
+            self._init_cuda(layer_idx)
 
-    def optimize_last_entries(self, layer_idx: int, n_optimize: int, step: int) -> None:
+    def optimize_last_entries(self, layer_idx: int, n_optimize: int) -> None:
         to_wrap = None
         timestep = None
 
@@ -146,6 +138,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
             old_norm = self.cached_sq_norms[layer_idx][:, :, :, None]  # (B, H, S_old, 1)
             cross_term = torch.matmul(self.key_cache[layer_idx], key_states.transpose(-1, -2))  # (B, H, S_old, S_new)
             sq_dist = new_norm + old_norm - 2 * cross_term  # (B, H, S_old, S_new)
+            sq_dist.clamp_(0)  # sometimes numerical error can create negative values here
 
             # CAREFUL: this value will be 0 for padding
             variance_weight = new_cluster_sizes / (new_cluster_sizes + 1)
@@ -158,13 +151,13 @@ class IterativeReduceKVBiasCache(DynamicCache):
             # padding is determined by 0 in cluster size
             protect_range = 1 / variance_weight  # this will make 0 into inf
             protect_range = torch.clamp(protect_range - 100, 0)  # inf - 100 = inf; vw \in [1/2, 1)
-            protect_range[:, :, :self.decay_start_mvi] = torch.inf
+            protect_range[:, :, :self.protect_first] = torch.inf
             protect_range_bcast_4d = protect_range[:, :, :, None]  # broadcast over new seq
             variance_increase = variance_increase + protect_range_bcast_4d
 
             # (B, H, S_new) and (B, H, S_new)
             min_variance_increase, min_idx = torch.min(variance_increase, dim=-2)
-            merge_condition = min_variance_increase < self.get_mvi(step)
+            merge_condition = min_variance_increase < self.mvi
 
             invalid_variance = torch.isinf(min_variance_increase) | torch.isnan(min_variance_increase)
             merge_condition = merge_condition & ~invalid_variance
@@ -228,7 +221,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
 
             new_keys_sorted = torch.take_along_dim(key_states, idx_srt_4d, dim=-2) * not_merged_srt_4d
             new_values_sorted = torch.take_along_dim(value_states, idx_srt_4d, dim=-2) * not_merged_srt_4d
-            new_norms_sorted = torch.take_along_dim(new_sq_key_norms, idx_sorted, dim=-1) * not_merged_sorted
+            new_norms_sorted = (torch.sum(new_keys_sorted ** 2, dim=-1) ** 2) * not_merged_sorted
 
             self.cluster_sizes[layer_idx].scatter_(dim=-1, index=seq_idx, src=not_merged_sorted.to(dtype=torch.long))
             self.key_cache[layer_idx].scatter_(dim=-2, index=seq_idx_4d, src=new_keys_sorted)
@@ -269,12 +262,11 @@ class IterativeReduceKVBiasCache(DynamicCache):
             cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        # wait for the optimization from the previous timestep to finish
-        if self.orchestrator is not None and self.optimize_streams[layer_idx] is not None:
-            self.orchestrator.start_forward(layer_idx, stream=torch.cuda.current_stream())
-
         batch_size, n_heads, seq_length, head_dims = key_states.shape
         device = key_states.device
+
+        if self.orchestrator is not None:
+            self.orchestrator.start_forward(layer_idx, stream=torch.cuda.current_stream())
 
         # Update the cache
         if key_states is not None:
@@ -322,7 +314,7 @@ class IterativeReduceKVBiasCache(DynamicCache):
 
         # optimize the last entry added
         # on CUDA, this will be called in a separate Stream and CPU process will continue ASAP
-        self.optimize_last_entries(layer_idx=layer_idx, n_optimize=seq_length, step=self.curr_length[layer_idx])
+        self.optimize_last_entries(layer_idx=layer_idx, n_optimize=seq_length)
 
         # log(0) = -inf, so the padding will have 0 attention score
         return self.key_cache[layer_idx], self.value_cache[layer_idx], torch.log(self.cluster_sizes[layer_idx])
