@@ -67,10 +67,14 @@ class OptimizationOrchestrator:
 
     @staticmethod
     def cleanup(storage: Dict[int, Dict[int, Event]]):
+        to_delete = []
         for timestep in storage:
             for layer_id in storage[timestep]:
                 if storage[timestep][layer_id].query():
-                    del storage[timestep][layer_id]
+                    to_delete.append((timestep, layer_id))
+                    
+        for timestep, layer_id in to_delete:
+            del storage[timestep][layer_id]
             if not len(storage[timestep]):
                 del storage[timestep]
 
@@ -86,7 +90,7 @@ class OptimizationOrchestrator:
         """
         prev_timestep, prev_layer_id = self.forward_progress
 
-        if layer_id <= prev_layer_id:
+        if layer_id <= prev_layer_id or prev_timestep == -1:
             # the previous timestep is finished
             self.complete_events_at_timestep(self.incomplete_forward, prev_timestep, stream=stream, strict=strict)
 
@@ -95,6 +99,9 @@ class OptimizationOrchestrator:
             # clean up once per timestep
             self.cleanup(self.incomplete_optimization)
             self.cleanup(self.incomplete_forward)
+        elif prev_timestep < 0:
+            # the first call
+            timestep = 0
         else:
             timestep = prev_timestep
 
@@ -115,7 +122,8 @@ class OptimizationOrchestrator:
             return timestep  # no optimization to wait for
 
         # we can start the forward once the optimization from the previous step is complete
-        self.claim_event(self.incomplete_optimization, timestep - 1, layer_id, stream=stream)
+        if timestep > 0:
+            self.claim_event(self.incomplete_optimization, timestep - 1, layer_id, stream=stream)
         return timestep
 
     def start_optimization(self, layer_id: int, stream: Optional[Stream] = None) -> int:
